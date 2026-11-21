@@ -1,0 +1,21 @@
+# Unreal Engine -- generated, never committed
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+.vs/
+*.target
+*.patch_*.exe
+*.patch_*.pdb
+*.patch_*.lib
+*.patch_*.exp
+
+# OS
+Thumbs.db
+.DS_Store
