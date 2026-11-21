@@ -1,11 +1,43 @@
 # HissConveyanceSpline — 样条线导引系统
 
-> Unreal Engine 5.8 工程：一条**从角色到土地庙的动态样条路径**，中点会跟随角色移动而伸缩，
-> 沿线有流动的粒子光效。样条线系统**仍在开发中**。
+> Unreal Engine 5.8 工程：**靠近坐火处（土地庙）的 Hiss 风格引导线**。
+> Niagara 粒子沿样条线运动，屏幕 RenderTarget 记录粒子速度在屏幕上的投影，
+> 再用 Niagara 的 Grid2D 做 Navier-Stokes 流体解算，最后结合深度值合成出流体质感的引导效果。
+> 样条线系统**仍在开发中**。
 
 [![UE](https://img.shields.io/badge/Unreal%20Engine-5.8-0E1128)](https://www.unrealengine.com)
 [![Platform](https://img.shields.io/badge/Platform-Win64-blue)]()
 [![Status](https://img.shields.io/badge/Status-WIP-orange)]()
+
+---
+
+## 技术方案
+
+整条效果是**粒子 → 屏幕空间速度场 → 流体解算 → 合成**的链路，不是简单的拖尾：
+
+```
+① Niagara 粒子沿样条线运动
+        │   粒子位置 = 中点路径上的采样点，随时间向土地庙流动
+        ▼
+② 屏幕 RenderTarget 记录粒子的速度投影
+        │   RT_Fluid 存的是屏幕空间速度场（不是颜色）
+        ▼
+③ Niagara Grid2D 解 Navier-Stokes 流体
+        │   用上一步的速度场作为外力项驱动流体，产生扩散、卷曲、涡流
+        ▼
+④ 结合场景深度合成最终引导线
+            流体结果 + 深度值 + Niagara 光效 → Hiss 风格的半透明流体引导线
+```
+
+| 资产 | 作用 |
+|---|---|
+| `Content/ConveyanceSpline/Effect_Spline/Nia_Fluid.uasset` | Grid2D 流体解算的 Niagara 系统 |
+| `Content/ConveyanceSpline/Effect_Spline/RT_Fluid.uasset` | 屏幕空间速度场渲染目标 |
+| `Content/FX/NS_SplineGlow.uasset` | 沿样条线流动的光效粒子 |
+| `Source/.../SplineRouteActor.*` | 提供样条路径与粒子位置（C++） |
+
+> 为什么用屏幕空间速度场而不是直接让粒子拖尾：直接拖尾只能得到"线"，做不出流体的**卷曲和涡流**。
+> 把粒子的运动投影到屏幕速度场后交给 Grid2D 解算，才会出现 Hiss 那种黏稠、会自己打卷的质感。
 
 ---
 
@@ -14,7 +46,7 @@
 | 内容 | 位置 | 说明 |
 |---|---|---|
 | **样条线导引系统** | `Source/.../SplineRouteActor.*` + `Content/ConveyanceSpline/Effect_Spline/` | 核心功能，见下文 |
-| **Niagara 特效** | `Content/FX/NS_SplineGlow.uasset`、`Content/ConveyanceSpline/Effect_Spline/Nia_Fluid.uasset` | 沿线流动粒子 + 流体 |
+| **Niagara 特效** | `Content/FX/NS_SplineGlow.uasset`、`Content/ConveyanceSpline/Effect_Spline/Nia_Fluid.uasset` | 沿线流动粒子 + 流体解算 |
 | **土地庙资产** | `Content/Target/ASS_Target/` | 树根/树屋/屋顶模型、材质实例、花草植被（58 MB） |
 | **模板内容** | `Content/{Characters,ThirdPerson,Variant_Combat,Variant_Platforming,Variant_SideScrolling,LevelPrototyping,Input}` | UE 官方模板资产，未改动 |
 
@@ -128,10 +160,15 @@ UE_ConveyanceSpline/
 
 ## 未完成的部分
 
+**样条线 / 路径**
 - 中点在极端角度下的过渡还有跳跃（尤其角色绕到土地庙背后时）
 - 粒子池大小固定，路径变长时粒子会变稀疏
 - 没有做路径遮挡处理（穿过墙时粒子会穿模）
-- Niagara 流体（`Nia_Fluid`）只做了原型，未接入最终表现
+
+**流体链路**
+- `Nia_Fluid` 的 Grid2D 解算只做了原型，参数（粘性 / 扩散 / 涡量）还没调到最终手感
+- 屏幕空间速度场的分辨率与粒子数还没做平衡，粒子多时速度场会糊
+- 深度合成只做了基本遮挡，没有做软粒子过渡
 
 ---
 
