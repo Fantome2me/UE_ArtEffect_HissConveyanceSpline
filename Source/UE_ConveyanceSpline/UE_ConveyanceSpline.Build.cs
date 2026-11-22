@@ -22,7 +22,7 @@ public class UE_ConveyanceSpline : ModuleRules
 			"Niagara"
 		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore", "RHI", "RenderCore" });
 
 		PublicIncludePaths.AddRange(new string[] {
 			"UE_ConveyanceSpline",

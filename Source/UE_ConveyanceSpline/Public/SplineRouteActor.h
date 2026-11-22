@@ -9,6 +9,7 @@
 
 class UNiagaraComponent;
 class UNiagaraSystem;
+class UConveyanceFluidSolver;
 
 UCLASS()
 class UE_CONVEYANCESPLINE_API ASplineRouteActor : public AActor
@@ -111,6 +112,14 @@ private:
 	/** 每颗粒子对应一个 Niagara 组件（复用的池子，不用每帧创建） */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UNiagaraComponent>> FxComponents;
+
+	// ================= C++ 版 NS 流体解算 =================
+	/** 替代 Niagara 的 8 个模拟阶段：CPU 解算 Navier-Stokes，输出一张 RGBA16F 场纹理 */
+	UPROPERTY(VisibleAnywhere, Category = "Fluid")
+	TObjectPtr<UConveyanceFluidSolver> FluidSolver;
+
+	/** 上一帧每颗粒子的屏幕 UV（0~1），用来算屏幕速度 */
+	TArray<FVector2f> LastParticleScreenUV;
 
 	bool bLineVisible = false;//当前显示状态缓存，避免每帧重复设置可见性
 	

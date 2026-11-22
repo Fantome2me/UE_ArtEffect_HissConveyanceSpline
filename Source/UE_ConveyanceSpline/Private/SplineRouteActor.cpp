@@ -9,7 +9,9 @@ UE_...GameMode.cpp     → 使用方：“什么时候建、起点是谁、终�
 #include "SplineRouteActor.h"
 
 // #include "DrawDebugHelpers.h"   // 调试球已关闭；想恢复 Yellow 调试球兜底时取消注释
+#include "ConveyanceFluidSolver.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
@@ -29,6 +31,9 @@ ASplineRouteActor::ASplineRouteActor()
 	Spline->SetClosedLoop(false, false);
 
 	Spline->SetDrawDebug(true);
+
+	// C++ 版 NS 流体解算（替代 Niagara 的 8 个模拟阶段）
+	FluidSolver = CreateDefaultSubobject<UConveyanceFluidSolver>(TEXT("FluidSolver"));
 }
 
 // Called when the game starts or when spawned
@@ -211,6 +216,15 @@ void ASplineRouteActor::Tick(float DeltaTime)
 	// ================= 写回样条 =================
 	if (bLineVisible)
 	{
+		// 流体注入需要的相机信息（每帧取一次）
+		APlayerController* PlayerController = Cast<APlayerController>(PlayerPawn->GetController());
+		int32 ViewportW = 0;
+		int32 ViewportH = 0;
+		if (PlayerController)
+		{
+			PlayerController->GetViewportSize(ViewportW, ViewportH);
+		}
+
 		//Spline上的动点
 		Spline->SetLocationAtSplinePoint(0, PlayerLoc, ESplineCoordinateSpace::World, false);
 		
@@ -272,12 +286,43 @@ void ASplineRouteActor::Tick(float DeltaTime)
 				// 调试球已按需求关闭：没有 Niagara 资产时这里什么都不画
 				// 想恢复"黄色调试球兜底"，把下面这行取消注释即可：
 				// DrawDebugSphere(GetWorld(), ParticlePos, FxSize, 8, FColor::Yellow, false, -1.f, 0, 1.f);
+
+				// ---------- 流体注入：把粒子的"屏幕位置 + 屏幕速度"喂给 NS 解算 ----------
+				if (FluidSolver && PlayerController && ViewportW > 0 && ViewportH > 0)
+				{
+					FVector2D ScreenPos = FVector2D::ZeroVector;
+					if (UGameplayStatics::ProjectWorldToScreen(PlayerController, ParticlePos, ScreenPos, false))
+					{
+						const FVector2f ScreenUV(
+							static_cast<float>(ScreenPos.X / static_cast<double>(ViewportW)),
+							static_cast<float>(ScreenPos.Y / static_cast<double>(ViewportH)));
+
+						if (LastParticleScreenUV.IsValidIndex(Index))
+						{
+							const FVector2f DeltaUV = ScreenUV - LastParticleScreenUV[Index];
+							const FVector2f ScreenVelUV = DeltaUV / FMath::Max(DeltaTime, KINDA_SMALL_NUMBER);
+							FluidSolver->PushSplat(ScreenUV, ScreenVelUV);
+						}
+
+						if (LastParticleScreenUV.Num() <= Index)
+						{
+							LastParticleScreenUV.SetNum(Index + 1);
+						}
+						LastParticleScreenUV[Index] = ScreenUV;
+					}
+				}
 			}
 
 			// 多余的组件隐藏起来
 			for (int32 i = Count; i < FxComponents.Num(); ++i)
 			{
 				FxComponents[i]->SetVisibility(false, true);
+			}
+
+			// ---------- 跑一帧 NS 解算（文章 8 个阶段的 C++ 版）----------
+			if (FluidSolver)
+			{
+				FluidSolver->Simulate(DeltaTime);
 			}
 		}
 	}
