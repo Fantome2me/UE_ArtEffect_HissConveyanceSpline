@@ -50,8 +50,6 @@
 | **土地庙资产** | `Content/Target/ASS_Target/` | 树根/树屋/屋顶模型、材质实例、花草植被（58 MB） |
 | **模板内容** | `Content/{Characters,ThirdPerson,Variant_Combat,Variant_Platforming,Variant_SideScrolling,LevelPrototyping,Input}` | UE 官方模板资产，未改动 |
 
-> 工程里**不含任何色调映射相关的内容**。之前的 AI 色调映射插件已拆分到独立仓库
-> [UE_Plugin_NeuralToneMapper](https://github.com/Fantome2me/UE_Plugin_NeuralToneMapper)。
 
 ---
 
