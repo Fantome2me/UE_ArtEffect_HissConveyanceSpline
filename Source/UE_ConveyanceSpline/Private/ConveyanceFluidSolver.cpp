@@ -2,11 +2,20 @@
 
 #include "ConveyanceFluidSolver.h"
 
+#include "Async/ParallelFor.h"
 #include "DynamicRHI.h"                 // FUpdateTextureRegion2D
+#include "Camera/CameraComponent.h"
+#include "Camera/PlayerCameraManager.h"
+#include "Components/PostProcessComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/Scene.h"
 #include "Engine/Texture2D.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialInterface.h"
 #include "HAL/IConsoleManager.h"
 #include "ImageUtils.h"
 #include "Math/Float16.h"
@@ -42,6 +51,19 @@ static void FluidViewCommand(const TArray<FString>& Args, UWorld* World)
 	}
 }
 
+static void FluidPPTestCommand(const TArray<FString>& Args, UWorld* World)
+{
+	if (UConveyanceFluidSolver* Solver = GFluidSolverForConsole.Get())
+	{
+		Solver->SetPPTest(Args.Num() > 0 ? FCString::Atof(*Args[0]) : 1.f);
+	}
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GFluidPPTestCmd(
+	TEXT("fluid.pptest"),
+	TEXT("fluid.pptest <0|1> : 1 = 挂纯洋红后处理材质，验证后处理链路"),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FluidPPTestCommand));
+
 static FAutoConsoleCommandWithWorldAndArgs GFluidDumpCmd(
 	TEXT("fluid.dump"),
 	TEXT("把当前流体视图存成 PNG（Saved/FluidDebug/）"),
@@ -70,6 +92,9 @@ void UConveyanceFluidSolver::BeginPlay()
 		TargetRT = LoadObject<UTextureRenderTarget2D>(nullptr,
 			TEXT("/Game/ConveyanceSpline/Effect_Spline/RT_Fluid.RT_Fluid"));
 	}
+
+	SetupRefractionMaterial();
+	SetupBloodTint();          // 屏幕血红覆盖层：RT 非黑底区域 = 半透明血红
 
 	if (TargetRT && (TargetRT->SizeX != Num || TargetRT->SizeY != Num))
 	{
@@ -351,12 +376,13 @@ void UConveyanceFluidSolver::DumpFieldToPNG()
 // ============================================================================
 // 文章「2. VolumeForce」：把船（粒子）的屏幕速度按高斯核 Lerp 进速度场
 // ============================================================================
-void UConveyanceFluidSolver::PushSplat(const FVector2f& InUV, const FVector2f& InVelocityUVPerSec)
+void UConveyanceFluidSolver::PushSplat(const FVector2f& InUV, const FVector2f& InVelocityUVPerSec, float StrengthScale)
 {
 	if (!InUV.ContainsNaN() && !InVelocityUVPerSec.ContainsNaN())
 	{
 		PendingSplatUV.Add(InUV);
 		PendingSplatVel.Add(InVelocityUVPerSec);
+		PendingSplatScale.Add(FMath::Clamp(StrengthScale, 0.05f, 4.f));
 	}
 }
 
@@ -374,9 +400,19 @@ void UConveyanceFluidSolver::InjectSplats(float DeltaSeconds)
 	const float InvSigma2 = 1.f / (2.f * FMath::Square(RadiusCells * 0.5f));
 	const int32 Reach = FMath::CeilToInt(RadiusCells * 1.5f);
 
-	for (int32 S = 0; S < PendingSplatUV.Num(); ++S)
+	// 先把这一帧的 splat 整理成只读数组（速度限幅 / 格坐标预先算好），下面好做行并行
+	const int32 SplatNum = PendingSplatUV.Num();
+	TArray<FVector2f> SplatVel;
+	TArray<int32> SplatCX;
+	TArray<int32> SplatCY;
+	TArray<float> SplatScale;
+	SplatVel.SetNumUninitialized(SplatNum);
+	SplatCX.SetNumUninitialized(SplatNum);
+	SplatCY.SetNumUninitialized(SplatNum);
+	SplatScale.SetNumUninitialized(SplatNum);
+
+	for (int32 S = 0; S < SplatNum; ++S)
 	{
-		const FVector2f SrcUV = PendingSplatUV[S];
 		FVector2f SrcVel = PendingSplatVel[S];
 
 		// 速度上限，避免数值爆炸
@@ -386,36 +422,79 @@ void UConveyanceFluidSolver::InjectSplats(float DeltaSeconds)
 			SrcVel = SrcVel / Speed * MaxSpeedUV;
 		}
 
-		const int32 CX = FMath::FloorToInt32(SrcUV.X * Num);
-		const int32 CY = FMath::FloorToInt32(SrcUV.Y * Num);
+		SplatVel[S] = SrcVel;
+		SplatCX[S] = FMath::FloorToInt32(PendingSplatUV[S].X * Num);
+		SplatCY[S] = FMath::FloorToInt32(PendingSplatUV[S].Y * Num);
+		SplatScale[S] = PendingSplatScale.IsValidIndex(S) ? PendingSplatScale[S] : 1.f;
+	}
 
-		for (int32 DY = -Reach; DY <= Reach; ++DY)
+	// 逐行并行：每行只归一个线程所有，所以同一格上的多颗粒子仍然按索引顺序累加，结果和串行完全一致
+	const float Strength = SplatStrength;
+	const float RadPush = RadialPush;
+	const float MaxSpeed = MaxSpeedUV;
+	const float Dt = DeltaSeconds;
+	const int32 RowBlock = 8;
+	const int32 NumTasks = FMath::DivideAndRoundUp(Num, RowBlock);
+
+	ParallelFor(NumTasks, [&](int32 T)
+	{
+		const int32 RowY0 = T * RowBlock;
+		const int32 RowY1 = FMath::Min(RowY0 + RowBlock, Num);
+
+		for (int32 S = 0; S < SplatNum; ++S)
 		{
-			for (int32 DX = -Reach; DX <= Reach; ++DX)
+			const int32 CX = SplatCX[S];
+			const int32 CY = SplatCY[S];
+			const int32 YA = FMath::Max(RowY0, CY - Reach);
+			const int32 YB = FMath::Min(RowY1 - 1, CY + Reach);
+			if (YA > YB)
 			{
-				const int32 X = CX + DX;
-				const int32 Y = CY + DY;
-				if (X < 0 || Y < 0 || X >= Num || Y >= Num)
+				continue;
+			}
+
+			const FVector2f SrcVel = SplatVel[S];
+			const float Scale = SplatScale[S];
+			const int32 XA = FMath::Max(0, CX - Reach);
+			const int32 XB = FMath::Min(Num - 1, CX + Reach);
+
+			for (int32 Y = YA; Y <= YB; ++Y)
+			{
+				const int32 DY = Y - CY;
+				for (int32 X = XA; X <= XB; ++X)
 				{
-					continue;
+					const int32 DX = X - CX;
+					const float Dist2 = static_cast<float>(DX * DX + DY * DY);
+					const float W = FMath::Exp(-Dist2 * InvSigma2);
+					const int32 I = IndexOf(X, Y);
+
+					// ① 方向拖曳：粒子把水往自己运动方向带
+					const float Alpha = FMath::Clamp(W * Strength * Dt * Scale, 0.f, 1.f);
+					VelField[I] = FMath::Lerp(VelField[I], SrcVel, Alpha);
+
+					// ② 径向挤压：把水从粒子位置往四周推开（产生"水面被挤开"的环状扰动）
+					if (RadPush > 0.f && Dist2 > KINDA_SMALL_NUMBER)
+					{
+						const FVector2f Dir =
+							FVector2f(static_cast<float>(DX), static_cast<float>(DY)).GetSafeNormal();
+						VelField[I] += Dir * (W * RadPush * Dt * Scale);
+
+						const float NewSpeed = VelField[I].Size();
+						if (NewSpeed > MaxSpeed)
+						{
+							VelField[I] = VelField[I] / NewSpeed * MaxSpeed;
+						}
+					}
+
+					// ③ 打上"笔迹"：刚划过的地方 = 1，之后随时间衰减（越早的划痕越淡）
+					Trace[I] = FMath::Max(Trace[I], W * Scale);
 				}
-
-				const float Dist2 = static_cast<float>(DX * DX + DY * DY);
-				const float W = FMath::Exp(-Dist2 * InvSigma2);
-
-				// 帧率无关的注入权重
-				const float Alpha = FMath::Clamp(W * SplatStrength * DeltaSeconds, 0.f, 1.f);
-				const int32 I = IndexOf(X, Y);
-				VelField[I] = FMath::Lerp(VelField[I], SrcVel, Alpha);
-
-				// 打上"笔迹"：刚划过的地方 = 1，之后随时间衰减（越早的划痕越淡）
-				Trace[I] = FMath::Max(Trace[I], W);
 			}
 		}
-	}
+	});
 
 	PendingSplatUV.Reset();
 	PendingSplatVel.Reset();
+	PendingSplatScale.Reset();
 }
 
 // ============================================================================
@@ -470,26 +549,35 @@ float UConveyanceFluidSolver::SampleScalarBilinear(const TArray<float>& Field, c
 void UConveyanceFluidSolver::Advect(float DeltaSeconds)
 {
 	const float InvNum = 1.f / static_cast<float>(Num);
+	const float UVStrength = FMath::Clamp(AdvectUVStrength, 0.f, 1.f);
+	const float MaxSpeed = MaxSpeedUV;
+	const float Dissipation = VelocityDissipation;
+	const float Dt = DeltaSeconds;
 
-	for (int32 Y = 0; Y < Num; ++Y)
+	// 逐行并行（行之间完全独立，读写的是不同的两块缓冲）
+	ParallelFor(Num, [&](int32 Y)
 	{
 		for (int32 X = 0; X < Num; ++X)
 		{
 			const int32 I = IndexOf(X, Y);
 			const FVector2f CellUV = UVField[I];
 			const FVector2f Vel = VelField[I];
+			const FVector2f GridUV((X + 0.5f) * InvNum, (Y + 0.5f) * InvNum);
 
 			// 回溯：x(t-dt) = x(t) - u * dt
-			const FVector2f BackUV = CellUV - Vel * DeltaSeconds;
+			const FVector2f BackUV = CellUV - Vel * Dt;
 
-			FVector2f NewVel = SampleVelocityBilinear(VelField, BackUV) * VelocityDissipation;
+			FVector2f NewVel = SampleVelocityBilinear(VelField, BackUV) * Dissipation;
 			FVector2f NewUV = SampleVelocityBilinear(UVField, BackUV);
+
+			// 限制 UV 被搬运的比例：不限制的话位移场会越滚越大，最后整张 RT 失控
+			NewUV = FMath::Lerp(GridUV, NewUV, UVStrength);
 
 			// 速度限幅
 			const float Speed = NewVel.Size();
-			if (Speed > MaxSpeedUV)
+			if (Speed > MaxSpeed)
 			{
-				NewVel = NewVel / Speed * MaxSpeedUV;
+				NewVel = NewVel / Speed * MaxSpeed;
 			}
 
 			// 越界钳制
@@ -499,10 +587,11 @@ void UConveyanceFluidSolver::Advect(float DeltaSeconds)
 			VelTemp[I] = NewVel;
 			UVTemp[I] = NewUV;
 		}
-	}
+	});
 
-	VelField = VelTemp;
-	UVField = UVTemp;
+	// 交换而不是整块拷贝（512 网格下每帧省掉两次 1MB memcpy）
+	Swap(VelField, VelTemp);
+	Swap(UVField, UVTemp);
 }
 
 // ============================================================================
@@ -510,19 +599,22 @@ void UConveyanceFluidSolver::Advect(float DeltaSeconds)
 // ============================================================================
 void UConveyanceFluidSolver::ComputeDivergence()
 {
-	for (int32 Y = 0; Y < Num; ++Y)
+	ParallelFor(Num, [&](int32 Y)
 	{
+		const int32 Ym = ClampIndex(Y - 1);
+		const int32 Yp = ClampIndex(Y + 1);
+
 		for (int32 X = 0; X < Num; ++X)
 		{
 			const int32 I = IndexOf(X, Y);
 			const FVector2f VL = VelField[IndexOf(ClampIndex(X - 1), Y)];
 			const FVector2f VR = VelField[IndexOf(ClampIndex(X + 1), Y)];
-			const FVector2f VD = VelField[IndexOf(X, ClampIndex(Y - 1))];
-			const FVector2f VU = VelField[IndexOf(X, ClampIndex(Y + 1))];
+			const FVector2f VD = VelField[IndexOf(X, Ym)];
+			const FVector2f VU = VelField[IndexOf(X, Yp)];
 
 			Divergence[I] = 0.5f * ((VR.X - VL.X) + (VU.Y - VD.Y));
 		}
-	}
+	});
 }
 
 // ============================================================================
@@ -530,24 +622,40 @@ void UConveyanceFluidSolver::ComputeDivergence()
 // ============================================================================
 void UConveyanceFluidSolver::SolvePressure()
 {
+	// 雅可比迭代：从 Src 读、往 Dst 写，每轮只交换指针（不再每轮做一次全网格拷贝）
 	PressureTemp = Pressure;
+
+	TArray<float>* Src = &PressureTemp;
+	TArray<float>* Dst = &Pressure;
 
 	for (int32 Iter = 0; Iter < PressureIterations; ++Iter)
 	{
-		for (int32 Y = 0; Y < Num; ++Y)
+		const float* S = Src->GetData();
+		float* D = Dst->GetData();
+
+		ParallelFor(Num, [&](int32 Y)
 		{
+			const int32 Ym = ClampIndex(Y - 1);
+			const int32 Yp = ClampIndex(Y + 1);
+
 			for (int32 X = 0; X < Num; ++X)
 			{
+				const int32 Xm = ClampIndex(X - 1);
+				const int32 Xp = ClampIndex(X + 1);
 				const int32 I = IndexOf(X, Y);
-				const float PL = PressureTemp[IndexOf(ClampIndex(X - 1), Y)];
-				const float PR = PressureTemp[IndexOf(ClampIndex(X + 1), Y)];
-				const float PD = PressureTemp[IndexOf(X, ClampIndex(Y - 1))];
-				const float PU = PressureTemp[IndexOf(X, ClampIndex(Y + 1))];
 
-				Pressure[I] = 0.25f * (PL + PR + PD + PU - Divergence[I]);
+				D[I] = 0.25f * (S[IndexOf(Xm, Y)] + S[IndexOf(Xp, Y)]
+					+ S[IndexOf(X, Ym)] + S[IndexOf(X, Yp)] - Divergence[I]);
 			}
-		}
-		PressureTemp = Pressure;
+		});
+
+		Swap(Src, Dst);
+	}
+
+	// 迭代次数为偶数时结果落在 PressureTemp 上，搬回 Pressure（一帧只搬一次）
+	if (Src != &Pressure)
+	{
+		Pressure = PressureTemp;
 	}
 }
 
@@ -556,20 +664,23 @@ void UConveyanceFluidSolver::SolvePressure()
 // ============================================================================
 void UConveyanceFluidSolver::ProjectVelocity()
 {
-	for (int32 Y = 0; Y < Num; ++Y)
+	ParallelFor(Num, [&](int32 Y)
 	{
+		const int32 Ym = ClampIndex(Y - 1);
+		const int32 Yp = ClampIndex(Y + 1);
+
 		for (int32 X = 0; X < Num; ++X)
 		{
 			const int32 I = IndexOf(X, Y);
 			const float PL = Pressure[IndexOf(ClampIndex(X - 1), Y)];
 			const float PR = Pressure[IndexOf(ClampIndex(X + 1), Y)];
-			const float PD = Pressure[IndexOf(X, ClampIndex(Y - 1))];
-			const float PU = Pressure[IndexOf(X, ClampIndex(Y + 1))];
+			const float PD = Pressure[IndexOf(X, Ym)];
+			const float PU = Pressure[IndexOf(X, Yp)];
 
 			VelField[I].X -= 0.5f * (PR - PL);
 			VelField[I].Y -= 0.5f * (PU - PD);
 		}
-	}
+	});
 }
 
 // ============================================================================
@@ -584,8 +695,10 @@ void UConveyanceFluidSolver::DecayTraceAndLocalize(float DeltaSeconds)
 
 	const float Life = FMath::Max(TraceLifeSeconds, 0.01f);
 	const float TraceMul = FMath::Exp(-DeltaSeconds / Life);   // 指数衰减，帧率无关
+	const float Kill = FieldKillFactor;
+	const int32 Total = Num * Num;
 
-	for (int32 I = 0; I < Num * Num; ++I)
+	ParallelFor(Total, [&](int32 I)
 	{
 		Trace[I] *= TraceMul;
 
@@ -594,9 +707,9 @@ void UConveyanceFluidSolver::DecayTraceAndLocalize(float DeltaSeconds)
 		const float Local = FMath::Clamp(Trace[I] * 4.f, 0.f, 1.f);
 		if (Local < 1.f)
 		{
-			VelField[I] *= FMath::Lerp(FieldKillFactor, 1.f, Local);
+			VelField[I] = VelField[I] * FMath::Lerp(Kill, 1.f, Local);
 		}
-	}
+	});
 }
 
 // ============================================================================
@@ -612,7 +725,7 @@ void UConveyanceFluidSolver::Recover()
 	const float InvNum = 1.f / static_cast<float>(Num);
 	const float Alpha = FMath::Clamp(RecoverRate, 0.f, 1.f);
 
-	for (int32 Y = 0; Y < Num; ++Y)
+	ParallelFor(Num, [&](int32 Y)
 	{
 		for (int32 X = 0; X < Num; ++X)
 		{
@@ -620,7 +733,7 @@ void UConveyanceFluidSolver::Recover()
 			const FVector2f CellUV((X + 0.5f) * InvNum, (Y + 0.5f) * InvNum);
 			UVField[I] = FMath::Lerp(UVField[I], CellUV, Alpha);
 		}
-	}
+	});
 }
 
 // ============================================================================
@@ -633,15 +746,55 @@ void UConveyanceFluidSolver::WriteOutputTexture()
 		return;
 	}
 
-	for (int32 I = 0; I < Num * Num; ++I)
+	float MaxVel = 0.f;
+
 	{
-		const FVector2f& UV = UVField[I];
-		const FVector2f& Vel = VelField[I];
-		PixelHalfs[I * 4 + 0] = FFloat16(UV.X);
-		PixelHalfs[I * 4 + 1] = FFloat16(UV.Y);
-		PixelHalfs[I * 4 + 2] = FFloat16(Vel.X);
-		PixelHalfs[I * 4 + 3] = FFloat16(Vel.Y);
+		const float InvNum = 1.f / static_cast<float>(Num);
+		const int32 BlockRows = 16;
+		const int32 NumTasks = FMath::DivideAndRoundUp(Num, BlockRows);
+		TArray<float> BlockMax;
+		BlockMax.SetNumZeroed(NumTasks);
+
+		ParallelFor(NumTasks, [&](int32 T)
+		{
+			float LocalMax = 0.f;
+			const int32 Y0 = T * BlockRows;
+			const int32 Y1 = FMath::Min(Y0 + BlockRows, Num);
+
+			for (int32 Y = Y0; Y < Y1; ++Y)
+			{
+				for (int32 X = 0; X < Num; ++X)
+				{
+					const int32 I = IndexOf(X, Y);
+					const FVector2f CellUV((X + 0.5f) * InvNum, (Y + 0.5f) * InvNum);
+
+					// RG = 位移场（流体 UV 偏离自身 UV 的量）—— 后处理材质直接拿它当折射偏移
+					// B  = 速度大小（血红覆盖层用它做 alpha）
+					const FVector2f Disp = UVField[I] - CellUV;
+
+					// 位移限幅到 ±0.02 UV（约 ±20px@1080p），防止折射把画面撕开
+					const float DispX = FMath::Clamp(Disp.X, -0.02f, 0.02f);
+					const float DispY = FMath::Clamp(Disp.Y, -0.02f, 0.02f);
+					const float Speed = VelField[I].Size();
+					LocalMax = FMath::Max(LocalMax, Speed);
+
+					PixelHalfs[I * 4 + 0] = FFloat16(DispX);
+					PixelHalfs[I * 4 + 1] = FFloat16(DispY);
+					PixelHalfs[I * 4 + 2] = FFloat16(Speed);
+					PixelHalfs[I * 4 + 3] = FFloat16(1.f);
+				}
+			}
+
+			BlockMax[T] = LocalMax;
+		});
+
+		for (int32 T = 0; T < NumTasks; ++T)
+		{
+			MaxVel = FMath::Max(MaxVel, BlockMax[T]);
+		}
 	}
+
+	LastMaxVel = MaxVel;
 
 	// 关键：Region 必须活到渲染线程执行完（引擎内部只保存指针），所以用 new + 回调里 delete
 	FUpdateTextureRegion2D* Region = new FUpdateTextureRegion2D(0, 0, 0, 0, static_cast<uint32>(Num), static_cast<uint32>(Num));
@@ -698,6 +851,148 @@ void UConveyanceFluidSolver::PushFieldToRenderTarget()
 }
 
 // ============================================================================
+// 折射材质：加载 / 建 MID / 挂到玩家相机
+// ============================================================================
+void UConveyanceFluidSolver::SetupRefractionMaterial()
+{
+	// 洋红测试材质：无条件准备好，方便随时验证后处理链路是否通（fluid.pptest 1）
+	if (!PPTestMID)
+	{
+		if (UMaterialInterface* TestMat = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Game/ConveyanceSpline/Effect_Spline/M_FluidPPTest.M_FluidPPTest")))
+		{
+			PPTestMID = UMaterialInstanceDynamic::Create(TestMat, this);
+			UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] 洋红测试材质已就绪（fluid.pptest 1 开启）"));
+		}
+	}
+
+	if (!bApplyRefraction)
+	{
+		return;
+	}
+
+	if (!RefractionMaterial)
+	{
+		RefractionMaterial = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Game/ConveyanceSpline/Effect_Spline/M_FluidRefraction.M_FluidRefraction"));
+	}
+	if (!RefractionMaterial)
+	{
+		UE_LOG(LogFluidSolver, Warning,
+			TEXT("[Fluid] 没找到 /Game/ConveyanceSpline/Effect_Spline/M_FluidRefraction，屏幕折射跳过（只显示可视化覆盖层）"));
+		return;
+	}
+
+	RefractionMID = UMaterialInstanceDynamic::Create(RefractionMaterial, this);
+	if (!RefractionMID)
+	{
+		return;
+	}
+
+	// 用 Unbound 的后处理组件挂到本 Actor 上 —— 比挂相机后处理更可靠（一定全局生效）
+	if (AActor* Owner = GetOwner())
+	{
+		UPostProcessComponent* PPComp = NewObject<UPostProcessComponent>(Owner);
+		if (PPComp)
+		{
+			PPComp->bEnabled = true;
+			PPComp->bUnbound = true;
+			PPComp->Priority = 1000.f;
+			PPComp->BlendWeight = 1.f;
+			PPComp->Settings.AddBlendable(RefractionMID, 1.0f);
+			PPComp->SetupAttachment(Owner->GetRootComponent());
+			PPComp->RegisterComponent();
+			PPCompRef = PPComp;
+
+			bRefractionBound = true;
+			UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] 折射材质已通过 PostProcessComponent(bUnbound) 全局生效"));
+		}
+	}
+
+	// 相机后处理也挂一份（有些工程的后处理体积会覆盖全局设置）
+	if (UWorld* World = GetWorld())
+	{
+		if (APlayerController* PC = World->GetFirstPlayerController())
+		{
+			if (APawn* Pawn = PC->GetPawn())
+			{
+				if (UCameraComponent* Cam = Pawn->FindComponentByClass<UCameraComponent>())
+				{
+					Cam->PostProcessSettings.AddBlendable(RefractionMID, 1.0f);
+					UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] 折射材质同时挂到相机 %s"), *Cam->GetName());
+				}
+			}
+		}
+	}
+	// 洋红测试材质：加载一次，命令开关时挂到 PP 组件上
+	if (!PPTestMID)
+	{
+		if (UMaterialInterface* TestMat = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Game/ConveyanceSpline/Effect_Spline/M_FluidPPTest.M_FluidPPTest")))
+		{
+			PPTestMID = UMaterialInstanceDynamic::Create(TestMat, this);
+			UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] 洋红测试材质已就绪（fluid.pptest 1 开启）"));
+		}
+	}
+}
+
+void UConveyanceFluidSolver::UpdateRefraction()
+{
+	if (!RefractionMID)
+	{
+		return;
+	}
+
+	if (FieldTexture)
+	{
+		RefractionMID->SetTextureParameterValue(TEXT("FluidRT"), FieldTexture);
+	}
+	// 折射强度 = 速度的线性函数：strength = Min + saturate(|v|/SpeedRef) * (Max - Min)
+	RefractionMID->SetScalarParameterValue(TEXT("StrengthMin"), RefractionStrengthMin);
+	RefractionMID->SetScalarParameterValue(TEXT("StrengthSpan"), RefractionStrengthMax - RefractionStrengthMin);
+	RefractionMID->SetScalarParameterValue(TEXT("InvSpeedRef"), 1.f / FMath::Max(RefractionSpeedRef, 0.01f));
+	RefractionMID->SetScalarParameterValue(TEXT("MaskScale"), RefractionMaskScale);
+	RefractionMID->SetScalarParameterValue(TEXT("GridSize"), static_cast<float>(Num));
+	// SolidTest 通道已随材质简化移除
+
+	// 兜底层：每帧塞进 PlayerCameraManager 的缓存 PP 混合（每帧开头会被清空，所以要每帧加）
+	if (bUseCameraManagerBlend)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (APlayerController* PC = World->GetFirstPlayerController())
+			{
+				if (PC->PlayerCameraManager)
+				{
+					FPostProcessSettings PP;
+					PP.WeightedBlendables.Array.Add(FWeightedBlendable(1.f, RefractionMID));
+					PC->PlayerCameraManager->AddCachedPPBlend(PP, 1.0f);
+				}
+			}
+		}
+	}
+	// 洋红测试开关（每帧调用 AddBlendable 会重复叠加，所以只在 SetPPTest 里切）
+}
+
+void UConveyanceFluidSolver::SetPPTest(float Value)
+{
+	bPPTestOn = (Value > 0.5f);
+	if (PPCompRef && PPTestMID)
+	{
+		if (bPPTestOn)
+		{
+			PPCompRef->Settings.AddBlendable(PPTestMID, 1.0f);
+		}
+		else
+		{
+			PPCompRef->Settings.RemoveBlendable(PPTestMID);
+		}
+	}
+	UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] PPTest = %d（PPComp=%d TESTMID=%d）"),
+		bPPTestOn ? 1 : 0, PPCompRef ? 1 : 0, PPTestMID ? 1 : 0);
+}
+
+// ============================================================================
 // 一帧完整解算（对应文章 8 个阶段的执行顺序）
 // ============================================================================
 void UConveyanceFluidSolver::Simulate(float DeltaSeconds)
@@ -725,6 +1020,8 @@ void UConveyanceFluidSolver::Simulate(float DeltaSeconds)
 	Recover();                 // 7 Recover
 	WriteOutputTexture();      // 8 RenderToRT
 	PushFieldToRenderTarget(); // 同步写进 RT 资产（可在编辑器里直接看）
+	UpdateRefraction();        // 把场纹理喂给屏幕折射材质
+	UpdateBloodTint();         // 把场纹理喂给屏幕血红覆盖层材质
 
 	if (bShowOnScreen)
 	{
@@ -758,4 +1055,139 @@ void UConveyanceFluidSolver::Simulate(float DeltaSeconds)
 				Num, Num, LastSplatCount, MaxSpeed, SumSpeed / FMath::Max(1, Total), MaxPressure, LastSimMs);
 		}
 	}
+}
+
+// ============================================================================
+// 屏幕血红覆盖层：RT 里"非黑"的像素 = 被粒子扰动过的区域，
+// 把这些区域在屏幕上叠一层半透明血红（材质 M_FluidBloodTint，PostProcess 域）
+// ============================================================================
+void UConveyanceFluidSolver::SetupBloodTint()
+{
+	if (!bApplyBloodTint)
+	{
+		return;
+	}
+
+	if (!BloodTintMaterial)
+	{
+		BloodTintMaterial = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Game/ConveyanceSpline/Effect_Spline/M_FluidBloodTint.M_FluidBloodTint"));
+	}
+	if (!BloodTintMaterial)
+	{
+		UE_LOG(LogFluidSolver, Warning,
+			TEXT("[Fluid] 没找到 /Game/ConveyanceSpline/Effect_Spline/M_FluidBloodTint，屏幕血红覆盖层跳过"));
+		return;
+	}
+
+	BloodTintMID = UMaterialInstanceDynamic::Create(BloodTintMaterial, this);
+	if (!BloodTintMID)
+	{
+		return;
+	}
+	UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] 屏幕血红覆盖层材质就绪：%s"),
+		*BloodTintMaterial->GetName());
+
+	// 折射关掉时 PP 组件是空的，这里自己建一个；
+	// 有就复用 —— 避免两个 Unbound 组件把同一个效果叠两次
+	if (!PPCompRef)
+	{
+		if (AActor* Owner = GetOwner())
+		{
+			UPostProcessComponent* PPComp = NewObject<UPostProcessComponent>(Owner);
+			if (PPComp)
+			{
+				PPComp->bEnabled = true;
+				PPComp->bUnbound = true;
+				PPComp->Priority = 1000.f;
+				PPComp->BlendWeight = 1.f;
+				PPComp->SetupAttachment(Owner->GetRootComponent());
+				PPComp->RegisterComponent();
+				PPCompRef = PPComp;
+			}
+		}
+	}
+
+	if (PPCompRef)
+	{
+		PPCompRef->Settings.AddBlendable(BloodTintMID, 1.f);
+		UE_LOG(LogFluidSolver, Log, TEXT("[Fluid] 血红覆盖层已挂到 PostProcessComponent(bUnbound)"));
+	}
+	else
+	{
+		// 建不出 PP 组件就退回 PlayerCameraManager（在 UpdateBloodTint 里每帧加）
+		UE_LOG(LogFluidSolver, Warning, TEXT("[Fluid] PP 组件没建出来，血红覆盖层改走相机兜底通道"));
+	}
+}
+
+void UConveyanceFluidSolver::UpdateBloodTint()
+{
+	if (!BloodTintMID)
+	{
+		return;
+	}
+
+	// 不透明度与 V 线性：alpha = saturate(V / Ref) * TintAlpha * 整体权重
+	//   最快的地方（V >= Ref）→ TintAlpha（默认 1.0，完全不透明）
+	//   最慢的地方（V = 0）    → 0（完全透明）
+	//   整体权重 BloodTintWeight 由 ASplineRouteActor 按"到土地庙的距离"每帧写入（和血丝同一套）
+	float Ref = FMath::Max(BloodTintSpeedRef, 0.01f);
+	if (bBloodTintAutoSpeed)
+	{
+		// 自动归一化：本帧最快的格子 alpha = 1（完全不透明），最慢 = 0（完全透明）
+		// 只留一个很小的下限，防止流场快死掉时把噪点放大成满屏血红
+		Ref = FMath::Max(LastMaxVel, 0.02f);
+	}
+
+	BloodTintMID->SetTextureParameterValue(TEXT("FluidRT"), FieldTexture);
+	BloodTintMID->SetVectorParameterValue(TEXT("BloodTintColor"), BloodTintColor);
+	BloodTintMID->SetScalarParameterValue(TEXT("InvSpeedRef"), 1.f / Ref);
+	BloodTintMID->SetScalarParameterValue(TEXT("TintAlpha"),
+		FMath::Clamp(BloodTintAlpha, 0.f, 1.f) * BloodTintWeight);
+	BloodTintMID->SetScalarParameterValue(TEXT("Brightness"), BloodTintBrightness);
+
+	// ---- 端点软洞：角色脚下 / 土地庙底部各挖一个圆形渐隐 ----
+	const float HoleScale = FMath::Max(BloodTintHoleScale, 0.0001f);
+	const FVector2D RA(FMath::Max(BloodTintEndARadius.X * HoleScale, 1e-4),
+		FMath::Max(BloodTintEndARadius.Y * HoleScale, 1e-4));
+	const FVector2D RB(FMath::Max(BloodTintEndBRadius.X * HoleScale, 1e-4),
+		FMath::Max(BloodTintEndBRadius.Y * HoleScale, 1e-4));
+
+	BloodTintMID->SetVectorParameterValue(TEXT("EndAUV"),
+		FLinearColor(static_cast<float>(BloodTintEndAUV.X), static_cast<float>(BloodTintEndAUV.Y), 0.f, 0.f));
+	BloodTintMID->SetVectorParameterValue(TEXT("InvRadiusA"),
+		FLinearColor(static_cast<float>(1.0 / RA.X), static_cast<float>(1.0 / RA.Y), 0.f, 0.f));
+	BloodTintMID->SetVectorParameterValue(TEXT("EndBUV"),
+		FLinearColor(static_cast<float>(BloodTintEndBUV.X), static_cast<float>(BloodTintEndBUV.Y), 0.f, 0.f));
+	BloodTintMID->SetVectorParameterValue(TEXT("InvRadiusB"),
+		FLinearColor(static_cast<float>(1.0 / RB.X), static_cast<float>(1.0 / RB.Y), 0.f, 0.f));
+
+	// 只有 PP 组件没建出来时才走这条 —— 保证效果只叠一次
+	if (!PPCompRef && bUseCameraManagerBlend)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (APlayerController* PC = World->GetFirstPlayerController())
+			{
+				if (PC->PlayerCameraManager)
+				{
+					FPostProcessSettings PP;
+					PP.WeightedBlendables.Array.Add(FWeightedBlendable(1.f, BloodTintMID));
+					PC->PlayerCameraManager->AddCachedPPBlend(PP, 1.0f);
+				}
+			}
+		}
+	}
+}
+
+// ============================================================================
+// 端点软洞：记录两端在屏幕上的 UV 和 UV 半径（半径由 0.5m 世界距离投影得到）
+// ============================================================================
+void UConveyanceFluidSolver::SetBloodTintEndpoints(const FVector2D& InUVA, const FVector2D& InRadiusA,
+	const FVector2D& InUVB, const FVector2D& InRadiusB)
+{
+	BloodTintEndAUV = InUVA;
+	BloodTintEndBUV = InUVB;
+	BloodTintEndARadius = FVector2D(FMath::Max(InRadiusA.X, 1e-4), FMath::Max(InRadiusA.Y, 1e-4));
+	BloodTintEndBRadius = FVector2D(FMath::Max(InRadiusB.X, 1e-4), FMath::Max(InRadiusB.Y, 1e-4));
 }

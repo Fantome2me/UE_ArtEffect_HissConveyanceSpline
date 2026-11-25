@@ -10,6 +10,9 @@
 class UNiagaraComponent;
 class UNiagaraSystem;
 class UConveyanceFluidSolver;
+class UProceduralMeshComponent;
+class UStaticMesh;
+class UMaterialInterface;
 
 UCLASS()
 class UE_CONVEYANCESPLINE_API ASplineRouteActor : public AActor
@@ -56,7 +59,7 @@ private:
 
 	//静止超过2.f（两秒），MidPoint慢慢移动到角色位置
 	UPROPERTY(EditDefaultsOnly, Category = "Route")
-	float StopDelay = 2.f;
+	float StopDelay = 1.f;
 
 	//连续移动超过5.f,返回到中点
 	UPROPERTY(EditDefaultsOnly, Category = "Route")
@@ -89,17 +92,78 @@ private:
 
 	// ================= 沿线粒子（黄色） =================
 	/** 粒子间距（厘米）：沿样条每隔这么远放一颗，"空隙"大小由它决定
-	 *  75 = 每 75cm 一颗（密度是原来 150 的两倍） */
+	 *  50 = 每 50cm 一颗（比 75 密 50%） */
 	UPROPERTY(EditDefaultsOnly, Category = "Route|Particles")
-	float FxSpacing = 75.f;
+	float FxSpacing = 50.f;
 
 	/** 粒子流动速度（厘米/秒）：从角色流向土地庙 */
 	UPROPERTY(EditDefaultsOnly, Category = "Route|Particles")
-	float FxSpeed = 300.f;
+	float FxSpeed = 150.f;
 
 	/** 粒子半径（厘米） */
 	UPROPERTY(EditDefaultsOnly, Category = "Route|Particles")
 	float FxSize = 12.f;
+
+	/** 粒子在"垂直于样条的圆盘"内做不规则运动的半径（厘米）。0.2m = 20 */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Particles")
+	float FxJitterRadius = 20.f;
+
+	/** 不规则运动的速度倍率（越大抖得越快） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Particles")
+	float FxJitterSpeedScale = 1.f;
+
+	/** 是否把粒子本身渲染出来（false = 只做流体注入，画面上看不到白点） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Particles")
+	bool bRenderParticles = false;
+
+	// ================= 沿样条的深血红丝线 =================
+	/** 丝线条数（一缕一缕） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	int32 StrandCount = 6;
+
+	/** 每条丝线切成几段（越大越贴曲线，成本越高） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	int32 StrandSegments = 14;
+
+	/** 丝线粗细（厘米） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	float StrandThickness = 1.7f;
+
+	/** 丝线在样条周围的横向摆动幅度（厘米） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	float StrandSway = 16.f;
+
+	/** 距土地庙远端的"紧密度"（20m 处）：0.25 → 偏移 4 倍 = 间距 2x */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	float StrandTightFar = 0.25f;
+
+	/** 距土地庙近端的"紧密度"（0m 处）*/
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	float StrandTightNear = 2.f;
+
+	/** 两端多少厘米内渐隐到全透明 */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	float EdgeFadeDistance = 50.f;
+
+	/** UV 平铺长度（厘米）：V 方向每多少厘米重复一次噪声（不是把整条 UV 拉伸到 0~1）*/
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	float StrandUVTile = 200.f;
+
+	/** 圆柱截面边数（6~12，越大越圆） */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	int32 StrandSides = 8;
+
+	/** 样条起点在角色上方多少厘米（0.3m = 30）*/
+	UPROPERTY(EditDefaultsOnly, Category = "Route")
+	float StartHeightOffset = 30.f;
+
+	/** 不透明度开始变透明处的距离（厘米）：MaxDistance(2000) 为 0，FadeStartDistance(1300) 为 1 */
+	UPROPERTY(EditDefaultsOnly, Category = "Route")
+	float FadeStartDistance = 1000.f;
+
+	/** 是否显示丝线 */
+	UPROPERTY(EditDefaultsOnly, Category = "Route|Strands")
+	bool bShowStrands = true;
 
 	/** 领头粒子已经走过的距离（内部状态，每帧自动累积，不用手填） */
 	float FxHeadDist = 0.f;
@@ -120,6 +184,31 @@ private:
 
 	/** 上一帧每颗粒子的屏幕 UV（0~1），用来算屏幕速度 */
 	TArray<FVector2f> LastParticleScreenUV;
+
+	/** 每颗粒子对水面的作用强度抖动（0.5 = 0.5~1.5 倍随机，越自然） */
+	UPROPERTY(EditDefaultsOnly, Category = "Fluid")
+	float FxStrengthJitter = 0.5f;
+
+	/** 丝线组件池 + 资源 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UProceduralMeshComponent>> StrandComps;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMesh> StrandMesh;
+
+	/** 每条飘带一个材质实例 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> StrandMIDs;
+
+	/** 每条飘带上次创建的顶点数：顶点数变化必须重建 section，否则 Update 失败会"冻住" */
+	UPROPERTY(Transient)
+	TArray<int32> StrandVertCounts;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> StrandMaterial;
+
+	/** 沿样条重建丝线（每帧调用） */
+	void RebuildStrands(float TotalLen);
 
 	bool bLineVisible = false;//当前显示状态缓存，避免每帧重复设置可见性
 	
